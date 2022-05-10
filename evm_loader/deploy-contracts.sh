@@ -7,6 +7,8 @@ fi
 
 solana config set --url "$SOLANA_URL"
 
+./wait-for-neon.sh 20
+
 # NOTE: If you change this key, keep in mind to update also token addresses in solidity/tokenlist.json file
 export DEPLOYER_PRIVATE_KEY='0x4deacb079b4714c38f39508aa8900039f2721ed8686835d43347ba9267da767b'
 export DEPLOYER_PUBLIC_KEY=$(python3 get_deployer_address.py)
@@ -30,5 +32,4 @@ neon-cli --commitment=processed --url "$SOLANA_URL" deposit 1000000000000 "$DEPL
 echo "Compiling and deploying contracts"
 cd /opt/contracts/
 npx hardhat compile
-sleep 20
 npx hardhat run --network ci /opt/contracts/scripts/deploy.js
