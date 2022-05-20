@@ -4,7 +4,6 @@ use evm::U256;
 use solana_program::account_info::AccountInfo;
 use solana_program::entrypoint::ProgramResult;
 use solana_program::msg;
-use solana_program::program_error::ProgramError;
 use solana_program::pubkey::Pubkey;
 
 use crate::account::{AccountData, ether_contract, Packable};
@@ -19,20 +18,6 @@ const CONTRACT_STORAGE_SIZE: usize =
 
 enum AccountIndexes {
     EthereumContract,
-}
-
-fn check_account_ownership(program_id: &Pubkey, account: &AccountInfo) -> ProgramResult {
-    if account.owner == program_id {
-        return Ok(());
-    }
-
-    msg!(
-        "Fail: The owner of tne account being processed is {}, but it must be {}.",
-        account.owner,
-        program_id,
-    );
-
-    Err(ProgramError::IncorrectProgramId)
 }
 
 fn extract_contract_storage(hamt: &Hamt) -> Vec<u8> {
@@ -52,8 +37,9 @@ fn extract_contract_storage(hamt: &Hamt) -> Vec<u8> {
             }
         }
     } else {
+        let storage_entries_in_contract_account = U256::from(STORAGE_ENTIRIES_IN_CONTRACT_ACCOUNT);
         for (key, value) in hamt.iter() {
-            if key.as_u32() < STORAGE_ENTIRIES_IN_CONTRACT_ACCOUNT {
+            if key < storage_entries_in_contract_account {
                 write_value(key.as_usize(), &value, &mut contract_storage);
             }
         }
@@ -62,31 +48,33 @@ fn extract_contract_storage(hamt: &Hamt) -> Vec<u8> {
 }
 
 fn convert_to_v2<'a>(
-    mut data: Vec<u8>,
+    data: &mut [u8],
     ethereum_contract_v1: &AccountData<'a, DataV1, ExtensionV1<'a>>,
-) -> Vec<u8> {
+) {
     const DATA_END: usize = TAG_SIZE + DataV1::SIZE;
+    const GENERATION_FIELD_SIZE: usize = size_of::<u32>();
 
     let contract_storage = extract_contract_storage(&ethereum_contract_v1.extension.storage);
     let code_size = ethereum_contract_v1.code_size as usize;
     let valids_size = code_size / 8 + 1;
-    let contract_storage_start = DATA_END + code_size + valids_size;
+    let addition_size = code_size + valids_size;
+    let mut contract_storage_start = DATA_END + addition_size;
 
-    // Trim or extend storage to `STORAGE_ENTIRIES_IN_CONTRACT_ACCOUNT` elements:
-    data.resize(contract_storage_start + CONTRACT_STORAGE_SIZE, 0);
+    assert!(data.len() >= contract_storage_start + CONTRACT_STORAGE_SIZE + GENERATION_FIELD_SIZE);
+
+    // Move `code` and `valids` to the new place:
+    data.copy_within(DATA_END..DATA_END + addition_size, DATA_END + GENERATION_FIELD_SIZE);
+    contract_storage_start += GENERATION_FIELD_SIZE;
+
+    // Write `generation` field:
+    data[DATA_END..DATA_END + GENERATION_FIELD_SIZE].copy_from_slice(&0u32.to_le_bytes()[..]);
+
     // Overwrite storage with the first elements:
-    data.splice(
-        contract_storage_start..contract_storage_start + CONTRACT_STORAGE_SIZE,
-        contract_storage,
-    );
-
-    // Insert `generation` field:
-    data.splice(DATA_END..DATA_END, 0u32.to_le_bytes());
+    data[contract_storage_start..contract_storage_start + CONTRACT_STORAGE_SIZE]
+        .copy_from_slice(&contract_storage);
 
     // Update data tag:
     data[0] = ether_contract::Data::TAG;
-
-    data
 }
 
 /// Processes the conversion of a data account from V1 to V2.
@@ -98,20 +86,13 @@ pub fn process<'a>(
     msg!("Instruction: ConvertStorageAccountFromV1ToV2");
 
     let account_info = &accounts[AccountIndexes::EthereumContract as usize];
-
-    check_account_ownership(program_id, account_info)?;
-
-    let data = account_info.data.borrow().to_vec();
     let ethereum_contract_v1 =
         AccountData::<ether_contract::DataV1, ether_contract::ExtensionV1>::from_account(
             program_id,
             account_info,
         )?;
 
-    let data = convert_to_v2(data, &ethereum_contract_v1);
-
-    account_info.realloc(data.len(), false)?;
-    account_info.data.borrow_mut().copy_from_slice(&data);
+    convert_to_v2(*account_info.data.borrow_mut(), &ethereum_contract_v1);
 
     Ok(())
 }
@@ -211,7 +192,7 @@ mod tests {
         data.splice(data.len().., hamt_buffer.borrow().iter().cloned());
 
         let mut lamports = 1u64;
-        let account_info = AccountInfo::new(
+        let mut account_info = AccountInfo::new(
             &pubkey,
             false,
             false,
@@ -222,18 +203,13 @@ mod tests {
             0,
         );
 
-        let mut converted = {
-            let data = account_info.data.borrow().to_vec();
-            let ethereum_contract_v1 =
-                AccountData::<DataV1, ExtensionV1>::from_account(
-                    &owner,
-                    &account_info,
-                )?;
+        let ethereum_contract_v1 =
+            AccountData::<DataV1, ExtensionV1>::from_account(
+                &owner,
+                &account_info,
+            )?;
 
-            convert_to_v2(data, &ethereum_contract_v1)
-        };
-
-        account_info.data.replace(converted.borrow_mut());
+        convert_to_v2(account_info.data.borrow_mut().as_ref_mut(), &ethereum_contract_v1);
 
         let ethereum_contract_v2 = EthereumContract::from_account(
             &owner,
